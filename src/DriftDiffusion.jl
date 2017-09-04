@@ -4,7 +4,7 @@ using MAT, ForwardDiff
 
 export make_adapted_cat_clicks, compute_LL, compute_trial
 
-
+#
 function compute_LL(data, params)
 
 
