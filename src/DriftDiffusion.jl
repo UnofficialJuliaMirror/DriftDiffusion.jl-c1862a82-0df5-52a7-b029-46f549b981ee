@@ -1,10 +1,13 @@
 module DriftDiffusion
 
-using MAT, ForwardDiff
+using MAT, ForwardDiff, MATLAB
 
-export make_adapted_cat_clicks, compute_LL, compute_trial
+export make_adapted_cat_clicks, compute_LL, compute_trial, DriftDiffusionHessian
 
-#
+
+
+
+
 function compute_LL(data, params)
 
 
@@ -23,7 +26,6 @@ else
     lapse = params[6];
 end
 
-# iterate over trials
 for i=1:length(data["pokedR"])
     ma,va = compute_trial(data,i,params);
 
@@ -45,7 +47,7 @@ for i=1:length(data["pokedR"])
 #    end
 
     # compute NLL for this trial
-    if convert(Bool,data["pokedR"][i])
+    if convert(Bool,pokedR[i])
         nll = -log(PR);
     else
         nll = -log(PL);
@@ -184,7 +186,11 @@ end
 end
 
 
-
+function DriftDiffusionHessian(data,x,params)
+    # compute hessian using autodiff
+    autodiff_hessian = ForwardDiff.hessian(x->compute_LL(data,x), params)
+    return autodiff_hessian
+end
 
 # package code goes here
 
