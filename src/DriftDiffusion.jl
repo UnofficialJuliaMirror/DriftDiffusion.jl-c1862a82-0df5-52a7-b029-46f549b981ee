@@ -2,187 +2,106 @@ module DriftDiffusion
 
 using MAT, ForwardDiff
 
-export make_adapted_cat_clicks, compute_LL, compute_trial, DriftDiffusionHessian
+export adapt_clicks, compute_LL, DriftDiffusionHessian
 
 
 
 
 
-function compute_LL(data, params)
+function compute_LL(bup_time,  bup_side, stim_dur, poke_r, input_params; nan_time=[], use_param=fill(true,8), param_default=[0, 1, 1, 0, 1, 0.1, 0, 0.01],use_prior=zeros(8), prior_mu=zeros(8), prior_var=zeros(8))
+
+if isempty(nan_time)
+    nan_time = fill(false, size(bup_time));
+end
+if ~all(prior_var[use_prior.==0] .== 0)
+    warn("some unused priors have nonzero variance")
+end
+if ~all(use_prior[prior_var.==0] .== 0)
+    error("cannot use a prior with 0 variance")
+end
 
 
-# Set up variables
-NLL = 0;
-if length(params) == 8
-    bias  = params[7];
-    lapse = params[8];
-elseif length(params) == 7
-#    bias  = params[6];
-#    lapse = params[7];
-    bias = params[7];
-    lapse = 0;
+params              = zeros(eltype(input_params), 8)
+params[.!use_param] = param_default[.!use_param]
+params[use_param]   = input_params
+
+# allocate array to store negative log likelihoods for each trial
+NLL     = zeros(eltype(input_params), length(poke_r), 1)
+
+# adapt those clicks
+if abs(params[5] - 1) > eps()
+    #adapted = adapt_clicks(bup_time, nan_time, params[5], params[6]) .* bup_side
+    adapted = adapt_clicks(bup_time, nan_time, params) .* bup_side
 else
-    bias  = params[5];
-    lapse = params[6];
+    adapted = bup_time;
+    adapted[.!nan_time] = 1
 end
 
-for i=1:length(data["pokedR"])
-    ma,va = compute_trial(data,i,params);
+# apply integration timescale
+temp = stim_dur.-bup_time
+temp = exp.(params[1]*temp)
 
-    # compute pr, pl with bias
-    pr = 0.5*(1+erf( -(bias-ma)/sqrt(2*va)));
-    pl = 1-pr;
+# compute mean of distribution
+mean_a = (adapted.*temp)
+mean_a = sum(mean_a.*(.!isnan.(mean_a)),1)
 
-    # compute pr, pl with lapse
-    PR = (1-lapse)*pr + lapse*0.5;
-    PL = (1-lapse)*pl + lapse*0.5;
+# compute variance
+init_var    = max(eps(), params[4])
+a_var       = max(eps(), params[2])
+c_var       = max(eps(), params[3])
 
-
-    # checking for log() stability
-#    if PR == 0
-#        PR = eps();
-#    end
-#    if PL == 0
-#        PL = eps();
-#    end
-
-    # compute NLL for this trial
-    if convert(Bool,pokedR[i])
-        nll = -log(PR);
-    else
-        nll = -log(PL);
-    end
-
-    # add to total over all trials
-    NLL += nll;
-end
-
-#on brodycomp: sum(p.prior.*params)
-# prior: 0.31, 0.94
-#NLL += params[2]*0.31 + params[4]*0.94;
-return NLL
-end
-
-
-
-function compute_trial(data, i, params);
-
-    # run clicks through the adaptation process
-    if length(params) == 8
-        cl, cr = make_adapted_cat_clicks(data["leftbups"][i], data["rightbups"][i], params[5],params[6]);
-    elseif length(params) == 7
-#        cl, cr = make_adapted_cat_clicks(data["leftbups"][i], data["rightbups"][i], params[4],params[5]);
-        cl, cr = make_adapted_cat_clicks(data["leftbups"][i], data["rightbups"][i], params[5],params[6]);
-    elseif length(params) == 6;
-        cl, cr = make_adapted_cat_clicks(data["leftbups"][i], data["rightbups"][i], params[3],params[4]);
-    end
-
-if isempty(cl)
-  clicks=cr;
-  times =  data["rightbups"][i];
-
-elseif isempty(cr)
-  clicks=-cl;
-  times = data["leftbups"][i];
-
+# initial variance and accumulation variance
+if abs(params[1]) < 1e-10
+    s2 = init_var*exp.(2*params[1]*stim_dur) + a_var*stim_dur
 else
-    clicks = [-cl cr];
-    times = [data["leftbups"][i] data["rightbups"][i]];
+    s2 = init_var*exp.(2*params[1]*stim_dur) + (a_var./(2*params[1]))*(exp.(2*params[1]*stim_dur)-1)
+end
+# add per click variance
+c2      = c_var .* abs.(adapted) .* temp .^ 2
+var_a   = s2 + sum(c2.*(.!isnan.(c2)),1)
 
+bias    = params[7]
+lapse   = min(max(params[8], eps()),  1-eps())
+
+
+pr = 0.5*(1+erf.( -(bias-mean_a)./sqrt.(2*var_a)))
+pl = 1-pr
+
+pl = (1-lapse)*pl+lapse/2
+pr = (1-lapse)*pr+lapse/2
+NLL = - log.(pr).*poke_r - log.(pl).*.!poke_r
+
+NLL_total = sum(NLL)
+
+# increment likelihood for priors
+for pp = find(use_prior)
+    NLL_total += -(params[pp]-prior_mu[pp])^2/(2*prior_var[pp])
 end
 
-    # compute mean of distribution
-    mean_a = 0;
-    for j=1:length(clicks)
-        mean_a += clicks[j]*exp(params[1]*(data["T"][i]-times[j]));
-    end
-
-    # compute variance of distribution
-    # three sources: initial (params[4]), accumulation (params[2]), and per-click (params[3])
-
-    if length(params) == 8
-        a_var    = params[2];
-        c_var    = params[3];
-        init_var = params[4];
-    elseif length(params) == 7
-#        a_var    = params[2];
-#        c_var    = params[3];
-#        init_var = 0;
-        a_var    = params[2];
-        c_var    = params[3];
-        init_var = params[4];
-    elseif length(params) == 6
-        a_var    = 0;;
-        c_var    = params[2];
-        init_var = 0;
-    end
-
-    # Initial and accumulation variance
-    if abs(params[1]) < 1e-10
-        s2 = init_var*exp(2*params[1]*data["T"][i]) + a_var*data["T"][i];
-    else
-        s2 = init_var*exp(2*params[1]*data["T"][i]) + (a_var/(2*params[1]))*(exp(2*params[1]*data["T"][i])-1);
-    end
-
-    # add per-click variance
-    for j=1:length(clicks)
-        s2 += c_var*abs(clicks[j])*exp(2*params[1]*(data["T"][i] - times[j]));
-    end
-
-    var_a = s2;
-
-    # return mean and variance of distribution
-    return mean_a, var_a
+return NLL_total
 end
 
 
-# Adaptation function with both within stream and across stream adaptation
-function make_adapted_cat_clicks(leftbups, rightbups, phi, tau_phi)
-if isempty(leftbups)
-  L = leftbups;
-  R = rightbups;
-  return L,R
+function adapt_clicks(bup_time, nan_time, params) #phi, tau_phi)
+phi     = params[5]
+tau_phi = params[6]
+#adapt   = copy(bup_time)
+adapt   = zeros(eltype(params), size(bup_time))
+adapt[.!nan_time] = 1
+phi     = max(0, phi)
+tau_phi = max(0, tau_phi)
+ici     = diff(bup_time)
+xxx = 0;
+for i = 2:size(bup_time,1)
+    #prev = tau_phi * log.(1 - adapt[i-1,:]*phi)
+    #adapt[i,:] = 1 - exp.( (-ici[i-1,:] + prev) / tau_phi)
+    adapt[i, :] = 1 + exp.(-ici[i-1,:]./tau_phi).*(adapt[i-1,:]*phi-1)
+    adapt[i, ici[i-1, :] .<= 0] = 0
+    adapt[i-1, ici[i-1,:] .<= 0] = 0
 end
-if isempty(rightbups)
-  L = leftbups;
-  R = rightbups;
-  return L,R
-end
-    if abs(phi - 1) > eps()
-        lefts  = [leftbups;  -ones(1,length(leftbups))];
-        rights = [rightbups; +ones(1,length(rightbups))];
-        allbups = sortrows([lefts rights]')'; # one bup in each col, second row has side bup was on
 
-        if length(allbups) <= 1
-            ici = [];
-        else
-            ici = (allbups[1,2:end]  - allbups[1,1:end-1])';
-        end
-
-        adapted = ones(typeof(phi), 1, size(allbups,2));
-
-        for i = 2:size(allbups,2)
-            if ici[i-1] <= 0
-            adapted[i-1] = 0;
-            adapted[i] =0;
-            else
-#            last = tau_phi * log(1 - adapted[i-1]*phi);
-#            adapted[i] = 1 - exp((-ici[i-1] + last)/tau_phi);
-            adapted[i] = 1+ exp(-ici[i-1]/tau_phi)*(adapted[i-1]*phi -1);
-            end
-        end
-
-    	adapted = real(adapted);
-
-    	L = adapted[allbups[2,:] .==-1]';
-    	R = adapted[allbups[2,:] .==+1]';
-    else
-    	# phi was equal to 1, there's no adaptation going on.
-    	L = leftbups;
-    	R = rightbups;
-    end
-
-    return L, R
+#adapt = real(complex(adapt))
+return adapt
 end
 
 
