@@ -1,6 +1,6 @@
 module DriftDiffusion
 
-using MAT, ForwardDiff
+using MAT, ForwardDiff, MATLAB
 
 export make_adapted_cat_clicks, compute_LL, compute_trial, DriftDiffusionHessian
 
