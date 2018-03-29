@@ -1,12 +1,12 @@
 module DriftDiffusion
 
-using ForwardDiff
+# using ForwardDiff
 
-export adapt_clicks, compute_LL, DriftDiffusionHessian, choptimes
+export adapt_clicks, compute_LL, DriftDiffusionHessian, DriftDiffusionGradient
 
 function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number},
     stim_dur::Array{<:AbstractFloat}, poke_r::Array{Bool}, input_params::Any ;
-    nan_times=fill(Bool,0), use_param=fill(true,1,9), param_default=[0, 1, 1, 0, 1, 0.1, 0, 0.01, 1],
+    nan_times=Array{Bool}(0), use_param=fill(true,1,9), param_default=[0 1 1 0 1 0.1 0 0.01 1],
     use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9), window_dt=0.01,
     adaptation_scales_perclick="var")
 
@@ -30,38 +30,46 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
     params_full[.!use_param] = param_default[.!use_param]
     params_full[use_param]   = input_params
     if params_full[end]<1
-        bup_times,nan_times,bup_side,nt = choptimes(bup_times,params_full[end],window_dt,stim_dur,bup_side);
+        sz=size(bup_times);
+        bup_times_normalized = broadcast(/,bup_times,stim_dur);
+        nt = (1-params_full[end])/window_dt;
+        bup_times = repmat(bup_times,1,nt);
+        in_window = Array{Bool}(size(bup_times));
+        for t=1:Int(round(nt))
+            inds=(1:sz[2])+sz[2]*(t-1);
+            time_window = [0 params_full[end]] + (t-1)*window_dt ;
+            in_window[:,inds] = (bup_times_normalized.>time_window[1]) .& (bup_times_normalized.<=time_window[2]);
+        end
+        bup_times[.~in_window] = NaN;
+        nan_times = isnan.(bup_times);
     else
         nt=1;
     end
     nTrials = length(poke_r);
     prob_poked_r = zeros(eltype(input_params),nt,nTrials);
-    var_a = zeros(eltype(input_params),nt,nTrials);
-    mean_a = zeros(eltype(input_params),nt,nTrials);
     NLL = zeros(eltype(input_params),1,nTrials);
 
     # calculate LL simultaneously for all trials, looping over time points
     for t=1:nt
         inds=(1:nTrials)+nTrials*(t-1);
         curr_buptimes = bup_times[:,inds];
-        curr_bup_side = bup_side[:,inds];
        if isempty(nan_times)
-           curr_nantimes = isnan(curr_buptimes);
+           curr_nantimes = isnan.(curr_buptimes);
        else
            curr_nantimes = nan_times[:,inds];
        end
         # adapt those clicks
         if abs(params_full[5] - 1) > eps()
-            adapted = adapt_clicks(curr_buptimes, curr_nantimes, params_full[5],params_full[6]) .* curr_bup_side
+            adapted = adapt_clicks(curr_buptimes, curr_nantimes, params_full[5],params_full[6]) .* bup_side
         else
-            adapted = copy(curr_bup_side);
+            adapted = copy(bup_side);
         end
         # apply integration timescale
         temp = stim_dur.-curr_buptimes
         temp = exp.(params_full[1]*temp)
         # compute mean of distribution
         temp2 = (adapted.*temp)
-        mean_a[t,:] = sum(temp2.*(.!isnan.(temp2)),1)
+        mean_a = sum(temp2.*(.!isnan.(temp2)),1)
         # compute variance
         init_var    = max(eps(), params_full[4])
         a_var       = max(eps(), params_full[2])
@@ -80,16 +88,14 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
         elseif adaptation_scales_perclick=="none"
             c2      = c_var .* temp .^ 2
         end
-        var_a[t,:]   = s2 + sum(c2.*(.!isnan.(c2)),1)
+        var_a   = s2 + sum(c2.*(.!isnan.(c2)),1)
         bias    = params_full[7]
         lapse   = min(max(params_full[8], eps()),  1-eps())
-        erfTerm = erf.( -(bias-mean_a[t,:])./sqrt.(2*var_a[t,:]));
+        erfTerm = erf.( -(bias-mean_a)./sqrt.(2*var_a));
         erfTerm[erfTerm.==1]=1-eps();
         erfTerm[erfTerm.==-1]=eps()-1;
         prob_poked_r[t,:]=((1-lapse).*(1+erfTerm)+lapse)/2 ;
     end
-    mean_a = mean(mean_a,1);
-    var_a = mean(var_a,1);
     prob_poked_r = mean(prob_poked_r,1);
     NLL[poke_r] = - ( log.( prob_poked_r[poke_r] ) );
     NLL[.!poke_r] = - ( log.(1- prob_poked_r[.!poke_r] ) );
@@ -117,7 +123,7 @@ function adapt_clicks(bup_times, nan_times, phi,tau_phi) #phi, tau_phi)
 end
 
 function DriftDiffusionHessian(bup_times,  bup_side, stim_dur, poke_r, input_params; nan_times=fill(Bool,0), use_param=fill(true,1,9),
-    param_default=[0, 1, 1, 0, 1, 0.1, 0, 0.01, 1],use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9),
+    param_default=[0 1 1 0 1 0.1 0 0.01 1],use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9),
     window_dt=0.01, adaptation_scales_perclick="var")
     # compute hessian using autodiff
     # (Adrian: For reasons I don't understand, you need to call compute_LL with explicit keyword declaration for ForwardDiff to run
@@ -127,28 +133,15 @@ function DriftDiffusionHessian(bup_times,  bup_side, stim_dur, poke_r, input_par
     return ForwardDiff.hessian(optimFun, input_params);
 end
 
-function choptimes(buptimes,window_size,window_dt,stim_dur,bup_side)
-    buptimes = broadcast(/,buptimes,stim_dur);
-    sz=size(buptimes);
-    nt = round((1-window_size)/window_dt);
-    buptimes_cat = zeros(sz[1],sz[2]*nt);
-    bup_side_cat = zeros(sz[1],sz[2]*nt);
-    for t=1:nt
-        inds=(1:sz[2])+sz[2]*(t-1);
-        buptimes_temp = copy(buptimes);
-        bup_side_temp  = copy(bup_side);
-        time_window = [0 window_size] + (t-1)*window_dt ;
-        in_window = buptimes>time_window[1] & buptimes<=time_window[2];
-        buptimes_temp[!in_window] = NaN;
-        bup_side_temp[!in_window] = NaN;
-        buptimes_temp = mapslices(sort,buptimes_temp,1);
-        sortIdx = mapslices(sortperm,buptimes_temp,1);
-        sub2ind_helper(x,y) = sub2ind(sz,x,y);
-        bup_side_cat[:,inds] = bup_side_temp( broadcast(sub2ind_helper, sortIdx, [ j for i=1:sz[1], j = 1:sz[2] ] )); # sort columns like buptime
-        buptimes_cat[:,inds] = broadcast(*,buptimes_temp,stim_dur);
-    end
-    nantimes_cat = isnan(buptimes_cat);
-    return buptimes_cat, nantimes_cat, bup_side_cat, nt
+function DriftDiffusionGradient(bup_times,  bup_side, stim_dur, poke_r, input_params; nan_times=fill(Bool,0), use_param=fill(true,1,9),
+    param_default=[0 1 1 0 1 0.1 0 0.01 1],use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9),
+    window_dt=0.01, adaptation_scales_perclick="var")
+    # compute hessian using autodiff
+    # (Adrian: For reasons I don't understand, you need to call compute_LL with explicit keyword declaration for ForwardDiff to run
+    optimFun(x) = DriftDiffusion.compute_LL(bup_times, bup_side, stim_dur, poke_r, x;nan_times=nan_times, use_param=use_param,
+        param_default=param_default,use_prior=use_prior, prior_mu=prior_mu, prior_var=prior_var,
+        window_dt=window_dt, adaptation_scales_perclick=adaptation_scales_perclick);
+    return ForwardDiff.jacobian(optimFun, input_params);
 end
 
 end # module
