@@ -1,6 +1,6 @@
 module DriftDiffusion
 
-# using ForwardDiff
+using ForwardDiff
 
 export adapt_clicks, compute_LL, DriftDiffusionHessian, DriftDiffusionGradient
 
