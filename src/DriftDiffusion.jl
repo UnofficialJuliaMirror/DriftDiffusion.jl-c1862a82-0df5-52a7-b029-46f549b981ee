@@ -2,17 +2,17 @@ module DriftDiffusion
 
 using ForwardDiff
 
-export adapt_clicks, compute_LL, DriftDiffusionHessian, DriftDiffusionGradient
+export adapt_clicks, compute_LL, DriftDiffusionHessian, DriftDiffusionVGH
 
 function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number},
     stim_dur::Array{<:AbstractFloat}, poke_r::Array{Bool}, input_params::Any ;
     nan_times=Array{Bool}(0), use_param=fill(true,1,9), param_default=[0 1 1 0 1 0.1 0 0.01 1],
     use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9), window_dt=0.01,
-    adaptation_scales_perclick="var")
+    adaptation_scales_perclick="var", nt=[])
 
     # validate inputs
-    @assert size(bup_times)==size(bup_side) "bup_side must be the same size as bup_times!"
-    @assert size(bup_times,2)==size(stim_dur,2) && size(bup_times,2)==size(poke_r,2) "bup_times, stim_dur, bup_side and poke_r must have the same 2nd dimension length (i.e. number of trials)"
+    @assert size(bup_times,1)==size(bup_side,1) "bup_times and bup_side must have same 1st dimension length (i.e. number of maxbups)"
+    @assert size(bup_side,2)==size(stim_dur,2) && size(bup_side,2)==size(poke_r,2) "bup_side, stim_dur, and poke_r must have the same 2nd dimension length (i.e. number of trials)"
     @assert length(use_param)==9 &&  length(use_param)==length(param_default) &&
         length(use_param)==length(use_prior) && length(use_param)==length(prior_mu) &&
         length(use_param)==length(prior_var) "use_param, param_default, use_prior, prior_mu, and prior_var must all have length 9 (because this is currently a 9-parameter model) ";
@@ -29,7 +29,7 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
     params_full              = zeros(eltype(input_params), 1,9)
     params_full[.!use_param] = param_default[.!use_param]
     params_full[use_param]   = input_params
-    if params_full[end]<1
+    if params_full[end]<1 & isempty(nt)
         sz=size(bup_times);
         bup_times_normalized = broadcast(/,bup_times,stim_dur);
         nt = (1-params_full[end])/window_dt;
@@ -42,7 +42,7 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
         end
         bup_times[.~in_window] = NaN;
         nan_times = isnan.(bup_times);
-    else
+    elseif isempty(nt)
         nt=1;
     end
     nTrials = length(poke_r);
@@ -109,7 +109,7 @@ end
 
 
 function adapt_clicks(bup_times, nan_times, phi,tau_phi) #phi, tau_phi)
-    adapt   = zeros(size(bup_times))
+    adapt   = zeros(eltype(phi),size(bup_times)); # this must be the same type as the params because these could be duals
     adapt[.!nan_times] = 1
     phi     = max(0, phi)
     tau_phi = max(0, tau_phi)
@@ -122,26 +122,17 @@ function adapt_clicks(bup_times, nan_times, phi,tau_phi) #phi, tau_phi)
     return adapt
 end
 
-function DriftDiffusionHessian(bup_times,  bup_side, stim_dur, poke_r, input_params; nan_times=fill(Bool,0), use_param=fill(true,1,9),
+function VGHfun(bup_times,  bup_side, stim_dur, poke_r, input_params; nan_times=fill(Bool,0), use_param=fill(true,1,9),
     param_default=[0 1 1 0 1 0.1 0 0.01 1],use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9),
-    window_dt=0.01, adaptation_scales_perclick="var")
+    window_dt=0.01, adaptation_scales_perclick="var", nt=[])
     # compute hessian using autodiff
     # (Adrian: For reasons I don't understand, you need to call compute_LL with explicit keyword declaration for ForwardDiff to run
     optimFun(x) = DriftDiffusion.compute_LL(bup_times, bup_side, stim_dur, poke_r, x;nan_times=nan_times, use_param=use_param,
         param_default=param_default,use_prior=use_prior, prior_mu=prior_mu, prior_var=prior_var,
-        window_dt=window_dt, adaptation_scales_perclick=adaptation_scales_perclick);
-    return ForwardDiff.hessian(optimFun, input_params);
-end
-
-function DriftDiffusionGradient(bup_times,  bup_side, stim_dur, poke_r, input_params; nan_times=fill(Bool,0), use_param=fill(true,1,9),
-    param_default=[0 1 1 0 1 0.1 0 0.01 1],use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9),
-    window_dt=0.01, adaptation_scales_perclick="var")
-    # compute hessian using autodiff
-    # (Adrian: For reasons I don't understand, you need to call compute_LL with explicit keyword declaration for ForwardDiff to run
-    optimFun(x) = DriftDiffusion.compute_LL(bup_times, bup_side, stim_dur, poke_r, x;nan_times=nan_times, use_param=use_param,
-        param_default=param_default,use_prior=use_prior, prior_mu=prior_mu, prior_var=prior_var,
-        window_dt=window_dt, adaptation_scales_perclick=adaptation_scales_perclick);
-    return ForwardDiff.jacobian(optimFun, input_params);
+        window_dt=window_dt, adaptation_scales_perclick=adaptation_scales_perclick, nt=nt);
+    out = DiffResults.HessianResult(zeros(size(input_params)));
+    out = ForwardDiff.hessian!(out,optimFun,input_params);
+    return DiffResults.value(out),DiffResults.gradient(out),DiffResults.hessian(out)
 end
 
 end # module
