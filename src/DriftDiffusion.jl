@@ -32,16 +32,17 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
     if params_full[end]<1 & isempty(nt)
         sz=size(bup_times);
         bup_times_normalized = broadcast(/,bup_times,stim_dur);
-        nt = (1-params_full[end])/window_dt;
+        nt = Int(round((1-params_full[end])/window_dt));
         bup_times = repmat(bup_times,1,nt);
         in_window = Array{Bool}(size(bup_times));
-        for t=1:Int(round(nt))
+        for t=1:nt
             inds=(1:sz[2])+sz[2]*(t-1);
             time_window = [0 params_full[end]] + (t-1)*window_dt ;
             in_window[:,inds] = (bup_times_normalized.>time_window[1]) .& (bup_times_normalized.<=time_window[2]);
         end
         bup_times[.~in_window] = NaN;
         nan_times = isnan.(bup_times);
+        stim_dur  = stim_dur.*params_full[end];
     elseif isempty(nt)
         nt=1;
     end
