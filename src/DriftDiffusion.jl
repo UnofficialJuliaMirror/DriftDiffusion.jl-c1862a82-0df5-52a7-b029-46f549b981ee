@@ -2,9 +2,9 @@ module DriftDiffusion
 
 using ForwardDiff
 
-export adapt_clicks, compute_LL, DriftDiffusionHessian, DriftDiffusionVGH
+export adapt_clicks, compute_LL, VGHfun
 
-function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number},
+function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::AbstractArray,
     stim_dur::Array{<:AbstractFloat}, poke_r::Array{Bool}, input_params::Any ;
     nan_times=Array{Bool}(0), use_param=fill(true,1,9), param_default=[0 1 1 0 1 0.1 0 0.01 1],
     use_prior=zeros(1,9), prior_mu=zeros(1,9), prior_var=zeros(1,9), window_dt=0.01,
@@ -32,7 +32,7 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
     if params_full[end]<1 & isempty(nt)
         sz=size(bup_times);
         bup_times_normalized = broadcast(/,bup_times,stim_dur);
-        nt = Int(round((1-params_full[end])/window_dt));
+        nt = Int(round((1-params_full[end])/window_dt))+1;
         bup_times = repmat(bup_times,1,nt);
         in_window = Array{Bool}(size(bup_times));
         for t=1:nt
@@ -46,10 +46,23 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
     elseif isempty(nt)
         nt=1;
     end
+    nansum(x::Array{Float64}) = sum(x.*.!isnan.(x),1);
     nTrials = length(poke_r);
     prob_poked_r = zeros(eltype(input_params),nt,nTrials);
     NLL = zeros(eltype(input_params),1,nTrials);
-
+    adapted = ones(eltype(bup_side),size(bup_side))
+    init_var = input_params[4];
+    a_var = input_params[2];
+    c_var = input_params[3];
+    lambda = input_params[1];
+    bias    = params_full[7]
+    lapse   = params_full[8]
+    bups_lambda_applied=1;
+    if lambda ==0
+        s2 = init_var + a_var*stim_dur
+    else
+        s2 = init_var*exp.(2*lambda*stim_dur) + (a_var./(2*lambda))*(exp.(2*lambda*stim_dur)-1)
+    end
     # calculate LL simultaneously for all trials, looping over time points
     for t=1:nt
         inds=(1:nTrials)+nTrials*(t-1);
@@ -60,43 +73,36 @@ function compute_LL(bup_times::Array{<:AbstractFloat},  bup_side::Array{<:Number
            curr_nantimes = nan_times[:,inds];
        end
         # adapt those clicks
-        if abs(params_full[5] - 1) > eps()
-            adapted = adapt_clicks(curr_buptimes, curr_nantimes, params_full[5],params_full[6]) .* bup_side
-        else
-            adapted = copy(bup_side);
-        end
+        adapted = adapt_clicks(curr_buptimes, curr_nantimes, params_full[5],params_full[6])
         # apply integration timescale
-        temp = stim_dur.-curr_buptimes
-        temp = exp.(params_full[1]*temp)
-        # compute mean of distribution
-        temp2 = (adapted.*temp)
-        mean_a = sum(temp2.*(.!isnan.(temp2)),1)
-        # compute variance
-        init_var    = max(eps(), params_full[4])
-        a_var       = max(eps(), params_full[2])
-        c_var       = max(eps(), params_full[3])
-        # initial variance and accumulation variance
-        if abs(params_full[1]) < 1e-10
-            s2 = init_var*exp.(2*params_full[1]*stim_dur) + a_var*stim_dur
-        else
-            s2 = init_var*exp.(2*params_full[1]*stim_dur) + (a_var./(2*params_full[1]))*(exp.(2*params_full[1]*stim_dur)-1)
+        if lambda!=0
+            bups_lambda_applied = exp(lambda * time_from_end[:,inds])
         end
+        # compute mean of distribution
+        mean_a = nansum(adapted.*bups_lambda_applied.*bup_side,1);
         # add per click variance
         if adaptation_scales_perclick=="std"
-            c2      = c_var .* abs.(adapted).^2 .* temp .^ 2
+            var_a      = s2 + nansum(c_var .* adapted.^2 .* bups_lambda_applied .^ 2,1);
         elseif adaptation_scales_perclick=="var"
-            c2      = c_var .* abs.(adapted) .* temp .^ 2
+            var_a      = s2 + nansum(c_var .* adapted .* bups_lambda_applied .^ 2 ,1);
         elseif adaptation_scales_perclick=="none"
-            c2      = c_var .* temp .^ 2
+            var_a      = s2 + nansum(c_var .* bups_lambda_applied .^ 2,1);
         end
-        var_a   = s2 + sum(c2.*(.!isnan.(c2)),1)
-        bias    = params_full[7]
-        lapse   = min(max(params_full[8], eps()),  1-eps())
-        erfTerm = erf.( -(bias-mean_a)./sqrt.(2*var_a));
+        no_noise_trials = (var_a .==0);
+        if any(no_noise_trials)
+            warn( @sprintf("Total noise variance is zero for %g trials. ",sum(no_noise_trials)),
+                "Could be due to a model with no noise terms or only stimulus noise but no bups on a trial. ",
+                "Adding eps to avoid NaNs but you may want to do some sanity checks.");
+            var_a[no_noise_trials]=eps;
+        end
+        erfTerm[:,inds] =  (mean_a-bias)./sqrt.(2*var_a);
+    end
+    erfTerm = erf(erfTerm);
+    if any(abs(erfTerm).==1)
         erfTerm[erfTerm.==1]=1-eps();
         erfTerm[erfTerm.==-1]=eps()-1;
-        prob_poked_r[t,:]=((1-lapse).*(1+erfTerm)+lapse)/2 ;
     end
+    prob_poked_r=((1-lapse).*(1+erfTerm)+lapse)/2 ;
     prob_poked_r = mean(prob_poked_r,1);
     NLL[poke_r] = - ( log.( prob_poked_r[poke_r] ) );
     NLL[.!poke_r] = - ( log.(1- prob_poked_r[.!poke_r] ) );
@@ -111,9 +117,10 @@ end
 
 function adapt_clicks(bup_times, nan_times, phi,tau_phi) #phi, tau_phi)
     adapt   = zeros(eltype(phi),size(bup_times)); # this must be the same type as the params because these could be duals
+    if phi<0 | tau_phi<0
+        error("adaptation parameters must be non-negative")
+    end
     adapt[.!nan_times] = 1
-    phi     = max(0, phi)
-    tau_phi = max(0, tau_phi)
     ici     = diff(bup_times)
     for i = 2:size(bup_times,1)
         adapt[i, :] = 1 + exp.(-ici[i-1,:]./tau_phi).*(adapt[i-1,:]*phi-1)
